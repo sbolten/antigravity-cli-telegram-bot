@@ -1576,18 +1576,10 @@ async function main(): Promise<void> {
         const promptSnippet = job.prompt ? ` (Prompt: <i>"${escapeHtml(job.prompt.slice(0, 60))}${job.prompt.length > 60 ? "..." : ""}"</i>)` : "";
         await telegram.sendMessage(
           chatId,
-          `⚡ <b>AGY Gateway restarted</b>\n\nYour previous request was interrupted by a restart${promptSnippet}.\n<i>Resuming execution now...</i>`,
+          `⚡ <b>AGY Gateway restarted</b>\n\nYour previous request was interrupted by a service restart${promptSnippet}.\n<i>To prevent restart loops, the job was not resumed automatically. Please send your prompt again if you wish to retry.</i>`,
           createMainKeyboard(settingsFor(chatId)),
           "HTML"
         ).catch(() => undefined);
-
-        enqueueJob(chatId, {
-          kind: job.kind || "prompt",
-          prompt: job.prompt,
-          imagePath: job.imagePath,
-          documentPath: job.documentPath,
-          documentName: job.documentName,
-        });
       } else {
         await telegram.sendMessage(
           chatId,
@@ -1601,8 +1593,17 @@ async function main(): Promise<void> {
 
   let offset = state.offset;
   while (true) {
-    try { const updates = await telegram.getUpdates(offset); for (const update of updates) { await handleUpdate(update); offset = update.update_id + 1; await state.setOffset(offset); } }
-    catch (error) { console.error(`polling error: ${(error as Error).message}`); await new Promise((resolve) => setTimeout(resolve, 5000)); }
+    try {
+      const updates = await telegram.getUpdates(offset);
+      for (const update of updates) {
+        offset = update.update_id + 1;
+        await state.setOffset(offset);
+        await handleUpdate(update);
+      }
+    } catch (error) {
+      console.error(`polling error: ${(error as Error).message}`);
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+    }
   }
 }
 
