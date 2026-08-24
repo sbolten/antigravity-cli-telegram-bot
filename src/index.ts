@@ -14,7 +14,7 @@ import { createMainKeyboard } from "./keyboards.js";
 import { JobQueue, type QueueJob } from "./queue.js";
 import { StateStore } from "./state.js";
 import { escapeHtml, findReferencedMediaFiles, formatTelegramHtmlChunks, splitMessage, splitPreformattedHtml, TelegramClient } from "./telegram.js";
-import type { AgyResult, AppConfig, ChatId, ConversationSummary, InlineButton, InlineKeyboardMarkup, ReplyMarkup, SessionSettings, StreamEvent, TelegramCallbackQuery, TelegramMessage, TelegramUpdate, Usage } from "./types.js";
+import type { AgyResult, AppConfig, ChatId, ConversationSummary, InFlightJob, InlineButton, InlineKeyboardMarkup, ReplyMarkup, SessionSettings, StreamEvent, TelegramCallbackQuery, TelegramMessage, TelegramUpdate, Usage } from "./types.js";
 
 const execFileAsync = promisify(execFile);
 const BOT_ROOT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -26,6 +26,7 @@ const convDb = new ConversationDatabase(config.agy.dbPath);
 const telegram = new TelegramClient(config.telegram.token);
 const controllers = new Map<string, AbortController>();
 const pendingDangerousCommands = new Map<string, string[]>();
+const pendingInterruptedJobs = new Map<string, InFlightJob>();
 
 export function isModelAllowed(modelId: string): boolean {
   return getActiveModels().some((model) => model.id === modelId) || config.agy.allowedModels.includes(modelId);
@@ -602,6 +603,23 @@ async function handleCallback(callback: TelegramCallbackQuery): Promise<void> {
   }
   if (data === "action:context") {
     enqueueJob(chatId, { kind: "context" });
+    return;
+  }
+  if (data === "action:retry_interrupted") {
+    const job = pendingInterruptedJobs.get(String(chatId));
+    if (!job) {
+      await telegram.editMessageText(chatId, messageId, "ℹ️ <i>Kein unterbrochener Job gefunden oder bereits ausgeführt.</i>", undefined, "HTML").catch(() => undefined);
+      return;
+    }
+    pendingInterruptedJobs.delete(String(chatId));
+    await telegram.editMessageText(chatId, messageId, "🔄 <b>Job wird wiederholt...</b>", undefined, "HTML").catch(() => undefined);
+    enqueueJob(chatId, {
+      kind: job.kind || "prompt",
+      prompt: job.prompt,
+      imagePath: job.imagePath,
+      documentPath: job.documentPath,
+      documentName: job.documentName,
+    });
     return;
   }
   if (data.startsWith("cli:")) {
@@ -1573,11 +1591,17 @@ async function main(): Promise<void> {
     await state.clearAllInFlight();
     for (const [chatId, job] of Object.entries(interrupted)) {
       if (job.prompt || job.kind === "usage" || job.kind === "credits" || job.kind === "context") {
+        pendingInterruptedJobs.set(String(chatId), job);
         const promptSnippet = job.prompt ? ` (Prompt: <i>"${escapeHtml(job.prompt.slice(0, 60))}${job.prompt.length > 60 ? "..." : ""}"</i>)` : "";
+        const retryKeyboard: InlineKeyboardMarkup = {
+          inline_keyboard: [
+            [button("🔄 Job wiederholen", "action:retry_interrupted")],
+          ],
+        };
         await telegram.sendMessage(
           chatId,
-          `⚡ <b>AGY Gateway restarted</b>\n\nYour previous request was interrupted by a service restart${promptSnippet}.\n<i>To prevent restart loops, the job was not resumed automatically. Please send your prompt again if you wish to retry.</i>`,
-          createMainKeyboard(settingsFor(chatId)),
+          `⚡ <b>AGY Gateway restarted</b>\n\nYour previous request was interrupted by a service restart${promptSnippet}.\n<i>Click the button below to resume execution.</i>`,
+          retryKeyboard,
           "HTML"
         ).catch(() => undefined);
       } else {
