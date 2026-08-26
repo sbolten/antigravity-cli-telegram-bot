@@ -122,9 +122,12 @@ const PYTHON_RUN_SCRIPT = `
 import sys
 import json
 import time
+import asyncio
 
 try:
-    from google.antigravity import Client
+    from google.antigravity import Agent, LocalAgentConfig
+    from google.antigravity.types import ContentPart
+    from google.antigravity.sessions import Conversation
 except ImportError:
     print(json.dumps({"error": "google.antigravity not installed"}))
     sys.exit(1)
@@ -132,40 +135,104 @@ except ImportError:
 prompt = sys.argv[1]
 model = sys.argv[2]
 conversation_id = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else None
+image_path = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else None
+document_path = sys.argv[5] if len(sys.argv) > 5 and sys.argv[5] else None
 
-try:
-    client = Client()
-    start_time = time.time()
+async def run_prompt():
+    try:
+        config = LocalAgentConfig()
+        start_time = time.time()
 
-    # We could stream, but for simplicity here we just run and return final json block
-    # In a full implementation we'd emit stream-json events
+        # Init event
+        print(json.dumps({
+            "event": "init",
+            "model": model or "antigravity-default"
+        }))
+        sys.stdout.flush()
 
-    response = client.agents.run(
-        prompt=prompt,
-        model=model or "antigravity-default"
-    )
+        files = []
+        if image_path:
+            files.append(ContentPart.from_file(image_path))
+        if document_path:
+            files.append(ContentPart.from_file(document_path))
 
-    duration = time.time() - start_time
+        async with Agent(config) as agent:
+            if conversation_id:
+                conversation = Conversation(agent=agent, session_id=conversation_id)
+            else:
+                conversation = Conversation(agent=agent)
 
-    usage = response.usage_metadata
+            kwargs = {"prompt": prompt}
+            if files:
+                kwargs["files"] = files
 
-    output = {
-        "text": getattr(response, "output_text", ""),
-        "model": model,
-        "conversationId": getattr(response, "session_id", conversation_id),
-        "usage": {
-            "prompt_tokens": getattr(usage, "prompt_token_count", 0),
-            "output_tokens": getattr(usage, "candidates_token_count", 0),
-            "total_tokens": getattr(usage, "total_token_count", 0)
-        },
-        "duration_seconds": duration,
-        "status": "SUCCESS"
-    }
-    print(json.dumps(output))
+            response = await conversation.chat(**kwargs)
 
-except Exception as e:
-    print(json.dumps({"error": str(e)}))
+            # Start streaming text
+            async for token in response:
+                print(json.dumps({
+                    "event": "step_update",
+                    "step_update": {
+                        "text_delta": token
+                    }
+                }))
+                sys.stdout.flush()
+
+            # Streaming thoughts if available
+            if hasattr(response, "thoughts"):
+                async for thought in response.thoughts:
+                    print(json.dumps({
+                        "event": "step_update",
+                        "step_update": {
+                            "step_type": "thinking",
+                            "thought": thought
+                        }
+                    }))
+                    sys.stdout.flush()
+
+            # End of response
+            end_time = time.time()
+            duration = end_time - start_time
+
+            usage = getattr(response, "usage_metadata", None)
+
+            result_payload = {
+                "model": model or "antigravity-default",
+                "duration_seconds": duration,
+                "status": "SUCCESS",
+                "conversation_id": getattr(conversation, "session_id", conversation_id),
+                "num_turns": getattr(conversation, "history", []),
+                "usage": {
+                    "prompt_tokens": getattr(usage, "prompt_token_count", 0) if usage else 0,
+                    "output_tokens": getattr(usage, "candidates_token_count", 0) if usage else 0,
+                    "total_tokens": getattr(usage, "total_token_count", 0) if usage else 0
+                }
+            }
+            if isinstance(result_payload["num_turns"], list):
+                result_payload["num_turns"] = len(result_payload["num_turns"])
+
+            print(json.dumps({
+                "event": "result",
+                "conversation_id": result_payload["conversation_id"],
+                "result": result_payload
+            }))
+            sys.stdout.flush()
+
+    except Exception as e:
+        print(json.dumps({
+            "event": "result",
+            "result": {
+                "status": "ERROR",
+                "error": str(e)
+            }
+        }))
+        sys.stdout.flush()
+
+if __name__ == "__main__":
+    asyncio.run(run_prompt())
 `;
+
+import { parseStreamOutput } from "./agy-runner.js";
 
 export function runAgyPython(
   config: AgyConfig,
@@ -177,10 +244,9 @@ export function runAgyPython(
     const { signal, onEvent, ...overrides } = options;
     const effectiveModel = overrides.model || config.model || "";
 
-    // Simulate streaming by just running synchronously here, but we will emit a single event and then resolve.
-    // In actual production we would write a python script that streams NDJSON.
+    const args = ["-c", PYTHON_RUN_SCRIPT, prompt, effectiveModel, conversationId || "", overrides.imagePath || "", overrides.documentPath || ""];
 
-    const child = spawn("python3", ["-c", PYTHON_RUN_SCRIPT, prompt, effectiveModel, conversationId || ""], {
+    const child = spawn("python3", args, {
       cwd: config.workspace,
       detached: true,
       stdio: ["ignore", "pipe", "pipe"],
@@ -188,6 +254,7 @@ export function runAgyPython(
 
     let stdout = "";
     let stderr = "";
+    let pendingLine = "";
     let settled = false;
 
     const killProcessGroup = (): void => {
@@ -217,8 +284,28 @@ export function runAgyPython(
 
     signal?.addEventListener("abort", abort, { once: true });
 
-    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+    const emit = (line: string): void => {
+      if (!line.trim()) return;
+      try {
+        if (onEvent) {
+          onEvent(JSON.parse(line) as StreamEvent);
+        }
+      } catch (error) {
+        // ignore parse error on partials
+      }
+    };
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      const text = chunk.toString();
+      stdout += text;
+      pendingLine += text;
+      const lines = pendingLine.split(/\r?\n/);
+      pendingLine = lines.pop() || "";
+      lines.forEach(emit);
+    });
+
     child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+
     child.on("error", (error) => {
       killProcessGroup();
       finish(() => reject(error));
@@ -226,6 +313,8 @@ export function runAgyPython(
 
     child.on("close", (code, sig) =>
       finish(() => {
+        emit(pendingLine);
+
         if (code !== 0 && !stdout.trim()) {
           const detail = stderr.trim().slice(0, 500);
           reject(new Error(`Python API exited with ${code ?? sig}${detail ? ": " + detail : ""}`));
@@ -233,39 +322,10 @@ export function runAgyPython(
         }
 
         try {
-          const parsed = JSON.parse(stdout.trim());
-          if (parsed.error) {
-             reject(new Error(parsed.error));
-             return;
-          }
-
-          const result: AgyResult = {
-             text: parsed.text || "",
-             parsed: parsed,
-             events: [],
-             conversationId: parsed.conversationId || conversationId,
-             model: parsed.model || effectiveModel,
-             usage: {
-               input_tokens: parsed.usage?.prompt_tokens,
-               output_tokens: parsed.usage?.output_tokens,
-               total_tokens: parsed.usage?.total_tokens
-             },
-             durationMs: (parsed.duration_seconds || 0) * 1000,
-             numTurns: null,
-             toolCalls: 0,
-             status: parsed.status
-          };
-
-          if (onEvent) {
-             onEvent({
-                event: "result",
-                result: parsed
-             });
-          }
-
+          const result = parseStreamOutput(stdout);
           resolve(result);
         } catch (e) {
-          reject(new Error("Failed to parse Python API output: " + stdout.trim() + " error: " + (e as Error).message));
+          reject(new Error("Failed to parse Python API output: error: " + (e as Error).message));
         }
       })
     );
