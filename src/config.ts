@@ -27,6 +27,10 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   const model = (env.AGY_MODEL || "").trim();
   if (model && !allowedModels.includes(model)) throw new Error(`AGY_MODEL is not in AGY_ALLOWED_MODELS: ${model}`);
   const dbPath = resolveEffectiveDbPath(env.AGY_DB_PATH);
+
+  const apiModeRaw = (env.AGY_API_MODE || "cli").trim().toLowerCase();
+  if (apiModeRaw !== "cli" && apiModeRaw !== "python") throw new Error("AGY_API_MODE must be 'cli' or 'python'");
+
   return {
     telegram: {
       token, allowedUserIds, allowedChatIds: numericCsvFrom(env, "TELEGRAM_ALLOWED_CHAT_IDS"),
@@ -38,6 +42,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       autoInterrupt: booleanFrom(env, "TELEGRAM_AUTO_INTERRUPT", false),
     },
     agy: {
+      apiMode: apiModeRaw as "cli" | "python",
       bin: (env.AGY_BIN || "/root/.local/bin/agy").trim(), workspace, project: (env.AGY_PROJECT || "").trim(), mode,
       sandbox: booleanFrom(env, "AGY_SANDBOX", false), allowSandboxDisable: booleanFrom(env, "AGY_ALLOW_SANDBOX_DISABLE", true),
       model, effort, allowedModels, timeoutMs: positiveIntegerFrom(env, "AGY_TIMEOUT_MS", 1_800_000),

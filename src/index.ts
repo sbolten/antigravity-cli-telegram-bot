@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { ConversationDatabase, formatRelativeTime, isUuid, type ConversationPage } from "./db.js";
 import { parseUsageQuota, parseCredits, parseContext, runPtyCommand } from "./pty-runner.js";
+import { runAgyPython, runPythonInfoCommand } from "./python-runner.js";
 import { formatStepUpdate, parseCommandArgs, runAgy, runAgyCommand, validateCustomArgs } from "./agy-runner.js";
 import { loadConfig, isEffort, isMode, isVerbose } from "./config.js";
 import { getActiveModels, getModelMaxContext, modelLabel, parseAgyModelsOutput, renderContextProgressBar, setActiveModels } from "./models.js";
@@ -1174,10 +1175,15 @@ async function processJob(job: QueueJob, isCancelled: () => boolean): Promise<vo
   if (job.kind === "usage") {
     try {
       await telegram.sendChatAction(job.chatId);
-      progressMessage = await telegram.sendMessage(job.chatId, "Checking AGY models & quota via PTY...");
-      const output = await runPtyCommand(config.agy, "/usage", { timeoutMs: 15_000, signal: controller.signal });
+      progressMessage = await telegram.sendMessage(job.chatId, "Checking AGY models & quota...");
+      let formatted: string;
+      if (config.agy.apiMode === "python") {
+        formatted = await runPythonInfoCommand(config.agy, "/usage", { timeoutMs: 15_000, signal: controller.signal });
+      } else {
+        const output = await runPtyCommand(config.agy, "/usage", { timeoutMs: 15_000, signal: controller.signal });
+        formatted = parseUsageQuota(output);
+      }
       if (isCancelled()) return;
-      const formatted = parseUsageQuota(output);
       if (progressMessage) await telegram.editMessageText(job.chatId, progressMessage.message_id, "Quota check complete.").catch(() => undefined);
       await replyWithHtml(job.chatId, formatted, createMainKeyboard(settingsFor(job.chatId)));
     } catch (error) {
@@ -1195,10 +1201,15 @@ async function processJob(job: QueueJob, isCancelled: () => boolean): Promise<vo
   if (job.kind === "credits") {
     try {
       await telegram.sendChatAction(job.chatId);
-      progressMessage = await telegram.sendMessage(job.chatId, "Checking AGY credits via PTY...");
-      const output = await runPtyCommand(config.agy, "/credits", { timeoutMs: 15_000, signal: controller.signal });
+      progressMessage = await telegram.sendMessage(job.chatId, "Checking AGY credits...");
+      let formatted: string;
+      if (config.agy.apiMode === "python") {
+        formatted = await runPythonInfoCommand(config.agy, "/credits", { timeoutMs: 15_000, signal: controller.signal });
+      } else {
+        const output = await runPtyCommand(config.agy, "/credits", { timeoutMs: 15_000, signal: controller.signal });
+        formatted = parseCredits(output);
+      }
       if (isCancelled()) return;
-      const formatted = parseCredits(output);
       if (progressMessage) await telegram.editMessageText(job.chatId, progressMessage.message_id, "Credits check complete.").catch(() => undefined);
       await replyWithHtml(job.chatId, formatted, createMainKeyboard(settingsFor(job.chatId)));
     } catch (error) {
@@ -1221,10 +1232,15 @@ async function processJob(job: QueueJob, isCancelled: () => boolean): Promise<vo
         return;
       }
       await telegram.sendChatAction(job.chatId);
-      progressMessage = await telegram.sendMessage(job.chatId, "Reading Active Context from the current AGY conversation via PTY...");
-      const output = await runPtyCommand(config.agy, "/context", { conversationId: session.conversationId, timeoutMs: 15_000, signal: controller.signal });
+      progressMessage = await telegram.sendMessage(job.chatId, "Reading Active Context from the current AGY conversation...");
+      let formatted: string;
+      if (config.agy.apiMode === "python") {
+        formatted = await runPythonInfoCommand(config.agy, "/context", { conversationId: session.conversationId, timeoutMs: 15_000, signal: controller.signal });
+      } else {
+        const output = await runPtyCommand(config.agy, "/context", { conversationId: session.conversationId, timeoutMs: 15_000, signal: controller.signal });
+        formatted = parseContext(output);
+      }
       if (isCancelled()) return;
-      const formatted = parseContext(output);
       if (progressMessage) await telegram.editMessageText(job.chatId, progressMessage.message_id, "Active Context check complete.").catch(() => undefined);
       await replyWithHtml(job.chatId, formatted, createMainKeyboard(settingsFor(job.chatId)));
     } catch (error) {
@@ -1307,7 +1323,8 @@ async function processJob(job: QueueJob, isCancelled: () => boolean): Promise<vo
         documentName: job.documentName,
         startedAt: Date.now(),
       });
-      result = await runAgy(config.agy, job.prompt || "", session?.conversationId || null, {
+
+      const runnerOptions = {
         ...settings,
         signal: controller.signal,
         imagePath: job.imagePath,
@@ -1321,7 +1338,13 @@ async function processJob(job: QueueJob, isCancelled: () => boolean): Promise<vo
           const update = formatStepUpdate(step);
           updateProgress(update);
         },
-      });
+      };
+
+      if (config.agy.apiMode === "python") {
+        result = await runAgyPython(config.agy, job.prompt || "", session?.conversationId || null, runnerOptions);
+      } else {
+        result = await runAgy(config.agy, job.prompt || "", session?.conversationId || null, runnerOptions);
+      }
     } finally {
       clearInterval(progressTicker);
       await state.clearInFlight(job.chatId);

@@ -98,6 +98,7 @@ export interface PersistedState {
 }
 
 export interface AgyConfig {
+  apiMode: "cli" | "python";
   bin: string;
   workspace: string;
   project: string;
